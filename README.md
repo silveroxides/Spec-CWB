@@ -1016,3 +1016,90 @@ When handing this specification over to an autonomous agent or merging engineer,
 - [ ] **Type & Device Alignment**: Tensors must be normalized and cast to `float32` during similarity matching, and returned to their original target `dtype` and `device` at the end of the operation.
 - [ ] **Norm Rescaling Safety**: Implement safety guards to ensure norm calculations do not divide by zero in case of null or empty vectors.
 - [ ] **Multi-layer Support**: Ensure the algorithm handles metadata arrays (like `pooled_output` or DeepStack per-layer weights) with the same consensus logic to maintain consistency across all network layers.
+
+---
+
+## 8. Extended Alignment and Weighting Semantics
+
+The following extensions are normative for implementations that expose the corresponding options. They preserve the original CWB behavior when disabled.
+
+### 8.1 Common-Prefix Preservation
+
+Conditioning sequences frequently begin with identical structural tokens (for example, BOS, system, or template tokens). An implementation MAY preserve the longest leading span shared by every input instead of sending it through greedy alignment. Two values are equal when every channel is within the configured absolute and relative tolerances:
+
+$$|x-y| \leq \text{atol} + \text{rtol}|y|$$
+
+The preserved prefix is copied from the reference input, removed before alignment, and prepended unchanged to the merged suffix. If no common prefix exists, normal alignment applies from position zero.
+
+### 8.2 Position-Biased Similarity Alignment
+
+For reference position $r$ and source position $s$, normalize positions to $p_r,p_s \in [0,1]$ and define:
+
+$$A_{r,s}=\exp\left(-\frac{1}{2}\left(\frac{p_r-p_s}{\sigma}\right)^2\right)$$
+
+where $\sigma=\max(1-w,1/\max(N_r,N_s,1))$ and $w \in [0,1]$ is `position_weight`. The greedy matcher uses:
+
+$$S'_{r,s}=(1-w)S_{r,s}+wA_{r,s}$$
+
+The original cosine score $S_{r,s}$, not $S'_{r,s}$, remains the value checked against `alignment_threshold`. Each row and column may be matched at most once.
+
+### 8.3 Dynamic Similarity Contrast and Soft-Comfort Bandpass
+
+When `dynamic_similarity_contrast` is enabled, similarities in a row are stretched to improve separation:
+
+$$\hat S_j=0.7+0.3\frac{S_j-S_{min}}{S_{max}-S_{min}+\epsilon}$$
+
+If all similarities are equal, use the unmodified values. For diversity weighting, use non-negative similarities clamped to $[0,1]$ before exponentiation. The standard bandpass is:
+
+$$W'_j=S_j^\alpha(1.001-S_j)^\beta$$
+
+The optional `soft_comfort_bandpass` uses a broader comfort distance:
+
+$$W'_j=\hat S_j^\alpha(1.5-\hat S_j)^\beta$$
+
+Weights are normalized over accepted candidates; if none are accepted or the sum is zero, use equal weights.
+
+### 8.4 Numerical Safety
+
+All normalization operations MUST use a positive epsilon. Similarities MUST be clamped to the domain required by the configured power before applying fractional exponents. Implementations MUST reject or safely handle non-finite input/output values, zero vectors, empty rows, and zero merged norms. Norm rescaling MUST leave a zero merged vector unchanged rather than dividing by zero.
+
+### 8.5 Model-Level Weights
+
+`weights` have different semantics for linear and consensus methods. Linear blending uses normalized model weights. Consensus blending uses the consensus-derived row weights defined above; model-level weights MUST either be incorporated explicitly into consensus construction and final row weights, or be rejected for consensus mode. An implementation MUST NOT silently accept model weights while ignoring them.
+
+## 9. Deterministic Spatial Visual Fusion
+
+Visual token sources MAY be fused by hard spatial assignment instead of numeric consensus. Every source MUST provide a valid $(H,W)$ grid whose product equals its token count. One source grid is selected as the canonical output grid; sources with different grids are remapped to it using nearest-neighbor spatial interpolation.
+
+Supported assignment methods are:
+
+- `spatial-checkerboard`: source index $(r+c) \bmod K$;
+- `spatial-block-interleave`: source index $(\lfloor r/b\rfloor+\lfloor c/b\rfloor) \bmod K$;
+- `spatial-dither-random`: seeded random selection of source zero, with remaining sources assigned by a checkerboard or block-interleave secondary pattern.
+
+The returned mask is a one-dimensional source-index array in canonical row-major order. A fixed seed MUST produce identical masks across repeated calls on the same device. Invalid grid shapes, source counts, block sizes, dither ratios, seeds, or perturbation values MUST raise a validation error.
+
+### 9.1 Spatial Perturbation and Cleanup
+
+`spatial_perturbation \in [0,1]` MAY exchange differently labelled cells using a deterministic seed. Exchanges MUST preserve the count of every source index. Optional dither cleanup MAY swap paired isolated primary cells and complementary holes; it MUST preserve source counts and leave unpaired islands unchanged.
+
+Mask caches MUST include every output-affecting parameter, including grid, source count, method, seed, block size, dither pattern, dither ratio, cleanup flag, and perturbation amount. DeepStack layers sharing the same spatial layout MUST reuse the same mask.
+
+Hard spatial fusion MUST preserve embedding dimensions, output token count, output dtype, and output device. Linear visual fusion remains the separate arithmetic mean path.
+
+## 10. Optional Restricted Tensor-Expression Blending
+
+Implementations MAY expose a declarative pointwise tensor-expression mode separate from CWB consensus. The grammar permits numeric constants, named tensor variables, unary `+`/`-`, binary `+`, `-`, `*`, `/`, `**`, and the functions `abs`, `min`, `max`, and `clamp`.
+
+Attribute access, indexing, comprehensions, arbitrary function calls, keyword arguments, and control-flow expressions MUST be rejected. Results MUST be finite, shape-compatible, and clamped to the target range where the tensor domain requires it. This mode MUST NOT be described as equivalent to consensus alignment.
+
+## 11. Extended Integration Checklist
+
+- [ ] Preserve numerically identical common prefixes when enabled.
+- [ ] Apply position bias only to matching scores; retain cosine threshold semantics.
+- [ ] Clamp and epsilon-stabilize all power and norm calculations.
+- [ ] Define and honor model-weight behavior for every merge method.
+- [ ] Validate explicit spatial grids and preserve source counts under perturbation/cleanup.
+- [ ] Seed and cache spatial masks deterministically using all relevant parameters.
+- [ ] Reuse spatial masks across compatible DeepStack layers.
+- [ ] Keep restricted tensor formulas separate from CWB alignment semantics.
